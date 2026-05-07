@@ -200,29 +200,50 @@ impl GQLClient {
         .await
         .map_err(|e| GraphQLError::with_text(format!("Can not get response: {:?}", e)))?;
 
-      let json: GraphQLResponse<K> = serde_json::from_str(&response_body_text).map_err(|e| {
-        GraphQLError::with_text(format!(
-          "Failed to parse response: {:?}. The response body is: {}",
-          e, response_body_text
-        ))
-      })?;
+      // Parse the response generically first so that on per-field errors we
+      // can still surface any partial `data` payload alongside the errors.
+      let json: GraphQLResponse<serde_json::Value> = serde_json::from_str(&response_body_text)
+        .map_err(|e| {
+          GraphQLError::with_text(format!(
+            "Failed to parse response: {:?}. The response body is: {}",
+            e, response_body_text
+          ))
+        })?;
 
       if !status.is_success() {
-        return Err(GraphQLError::with_message_and_json(
+        let mut err = GraphQLError::with_message_and_json(
           format!("The response is [{}]", status.as_u16()),
           json.errors.unwrap_or_default(),
-        ));
+        );
+        if let Some(data) = json.data {
+          err = err.with_data(data);
+        }
+        return Err(err);
       }
 
       // Check if error messages have been received
-      if json.errors.is_some() {
-        return Err(GraphQLError::with_json(json.errors.unwrap_or_default()));
-      }
-      if json.data.is_none() {
-        log::warn!(target: "gql-client", "The deserialized data is none, the response is: {}", response_body_text);
+      if let Some(errors) = json.errors {
+        let mut err = GraphQLError::with_json(errors);
+        if let Some(data) = json.data {
+          err = err.with_data(data);
+        }
+        return Err(err);
       }
 
-      return Ok(json.data);
+      let data = match json.data {
+        Some(value) => Some(serde_json::from_value::<K>(value).map_err(|e| {
+          GraphQLError::with_text(format!(
+            "Failed to deserialize response data: {:?}. The response body is: {}",
+            e, response_body_text
+          ))
+        })?),
+        None => {
+          log::warn!(target: "gql-client", "The deserialized data is none, the response is: {}", response_body_text);
+          None
+        }
+      };
+
+      return Ok(data);
     }
   }
 }
